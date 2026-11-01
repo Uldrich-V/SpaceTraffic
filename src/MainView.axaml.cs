@@ -1,184 +1,470 @@
-﻿using Avalonia;
-using Avalonia.Controls;
+﻿using Avalonia.Controls;
+using Avalonia.Controls.Shapes;
 using Avalonia.Media;
 using Avalonia.Threading;
+using SpaceTraffic.Data;
+using SpaceTraffic.Models;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
-using SpaceTraffic.Engine;
-using SpaceTraffic.Model;
-using SpaceTraffic.Parser;
 
 namespace SpaceTraffic;
 
 public partial class MainView : UserControl
 {
-    private readonly SimulationEngine _engine = new();
-    private readonly DispatcherTimer _renderTimer = new();
-    private readonly DispatcherTimer _simTimer = new();
+    public Scenar? CurrentScenario { get; private set; }
+
+    // Časovače
+    private DispatcherTimer _simTimer;
+    private DispatcherTimer _renderTimer;
+    private DateTime _simDate = new DateTime(2026, 9, 21);
+    private double _totalSimDays = 0;
+    private Random _random = new Random();
+
+    // Maximální poloměr celého systému (pro automatické škálování na okno)
+    private double _maxSystemRadius = 1.0;
+
+    private class TelesoVisual
+    {
+        public Ellipse OrbitLine { get; set; } = new();
+        public Ellipse BodyShape { get; set; } = new();
+        public TextBlock Label { get; set; } = new();
+        public Rectangle WarehouseBg { get; set; } = new();
+        public Rectangle WarehouseFg { get; set; } = new();
+        public TextBlock WarehouseText { get; set; } = new();
+    }
+
+    private class LodVisual
+    {
+        public Polygon ShipShape { get; set; } = new();
+        public TextBlock Label { get; set; } = new();
+        public TextBlock StatusArrow { get; set; } = new();
+    }
+
+    private Dictionary<VesmirneTeleso, TelesoVisual> _bodyVisuals = new();
+    private Dictionary<Lod, LodVisual> _shipVisuals = new();
 
     public MainView()
     {
         InitializeComponent();
 
-        // Načtení parametru z příkazové řádky (např. default nebo complex)
-        string scenarioName = "default";
-        var args = Environment.GetCommandLineArgs();
-        if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+        _simTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _simTimer.Tick += SimTimer_Tick;
+
+        _renderTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _renderTimer.Tick += RenderTimer_Tick;
+
+        // Pokud nebyl scénář načten přes NactiScenar, načteme výchozí
+        if (CurrentScenario == null)
         {
-            scenarioName = args[1];
+            NactiScenar(Program.ScenarioName);
+        }
+    }
+
+    public void NactiScenar(string scenarioName)
+    {
+        try
+        {
+            string filePath = System.IO.Path.Combine("data", scenarioName);
+            CurrentScenario = NacteniScn.Load(filePath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Chyba načítání scénáře: {ex.Message}");
+            return;
         }
 
-        // Vyhledání a načtení scénáře
-        string scenarioPath = FindScenarioPath(scenarioName);
-        var (bodies, destinations, ships) = ScenarioParser.Parse(scenarioPath);
-        _engine.LoadScenario(bodies, destinations, ships);
+        SpoctiMaxPolomerSystemu();
+        InicializujLode();
+        VytvorPrvkySceny();
 
-        // Časovač pro plynulé překreslování (60 FPS)
-        _renderTimer.Interval = TimeSpan.FromMilliseconds(16);
-        _renderTimer.Tick += (s, e) => InvalidateVisual();
+        _simTimer.Start();
         _renderTimer.Start();
 
-        // Simulační časovač (1 sekunda reálného času = 1 simulační den)
-        _simTimer.Interval = TimeSpan.FromSeconds(1);
-        _simTimer.Tick += (s, e) => _engine.ExecuteDiscreteStep();
-        _simTimer.Start();
+        SimulationTimeText.Text = _simDate.ToString("dd. MM. yyyy");
     }
 
-    private string FindScenarioPath(string scenarioName)
+    private void SpoctiMaxPolomerSystemu()
     {
-        var candidates = new List<string>
-        {
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", scenarioName),
-            Path.Combine(Directory.GetCurrentDirectory(), "data", scenarioName)
-        };
+        if (CurrentScenario == null) return;
 
-        // Prohledání nadřazených složek směrem nahoru k kořeni projektu
-        string? current = AppDomain.CurrentDomain.BaseDirectory;
-        for (int i = 0; i < 10 && current != null; i++)
+        double maxR = 0;
+        foreach (var body in CurrentScenario.Bodies)
         {
-            candidates.Add(Path.Combine(current, "data", scenarioName));
-            current = Directory.GetParent(current)?.FullName;
+            double cumR = GetCumulativeOrbitRadius(body);
+            if (cumR > maxR) maxR = cumR;
         }
 
-        current = Directory.GetCurrentDirectory();
-        for (int i = 0; i < 10 && current != null; i++)
-        {
-            candidates.Add(Path.Combine(current, "data", scenarioName));
-            current = Directory.GetParent(current)?.FullName;
-        }
-
-        foreach (var path in candidates)
-        {
-            if (File.Exists(path))
-                return path;
-        }
-
-        throw new FileNotFoundException(
-            $"Scénář '{scenarioName}' nebyl nalezen!\nProhledané cesty:\n" + string.Join("\n", candidates.Distinct()));
+        // Pokud tělesa nemají oběžné dráhy nebo jsou moc malé, dáme min. hodnotu
+        _maxSystemRadius = maxR > 0 ? maxR : 100.0;
     }
 
-    public override void Render(DrawingContext context)
+    private double GetCumulativeOrbitRadius(VesmirneTeleso body)
     {
-        base.Render(context);
-
-        double w = Bounds.Width;
-        double h = Bounds.Height;
-
-        // Pozadí
-        context.FillRectangle(Brushes.DarkBlue, new Rect(Bounds.Size));
-
-        if (_engine.Bodies.Count == 0) return;
-
-        // Zachování poměru stran scény
-        double maxRadius = _engine.Bodies.Max(b => b.OrbitRadius) * 2.4;
-        if (maxRadius <= 0) maxRadius = 10.0;
-
-        double scale = Math.Min(w / maxRadius, h / maxRadius);
-        double centerX = w / 2.0;
-        double centerY = h / 2.0;
-
-        Point WorldToScreen(double x, double y) => new Point(centerX + x * scale, centerY - y * scale);
-
-        // 1. Zobrazení simulačního času
-        var timeText = new FormattedText(
-            $"Simulační čas: {_engine.CurrentDate:dd. MM. yyyy}",
-            CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-            Typeface.Default, 15, Brushes.White);
-        context.DrawText(timeText, new Point(15, 15));
-
-        // 2. Vykreslení drah a těles
-        foreach (var body in _engine.Bodies)
+        double r = body.OrbitRadius;
+        if (!string.IsNullOrEmpty(body.ParentName) && CurrentScenario != null)
         {
-            var center = WorldToScreen(body.X, body.Y);
+            var parent = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == body.ParentName);
+            if (parent != null) r += GetCumulativeOrbitRadius(parent);
+        }
+        return r;
+    }
 
-            if (body.Parent != null)
+    private void InicializujLode()
+    {
+        if (CurrentScenario == null) return;
+        foreach (var lod in CurrentScenario.Ships)
+        {
+            var startBody = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == lod.StartBodyName);
+            if (startBody != null)
             {
-                var parentCenter = WorldToScreen(body.Parent.X, body.Parent.Y);
-                double orbitPx = body.OrbitRadius * scale;
-                context.DrawEllipse(null, new Pen(Brushes.Gray, 1, dashStyle: DashStyle.Dash), parentCenter, orbitPx, orbitPx);
+                var (x, y) = VypoctiFyzikalniPozici(startBody, 0);
+                lod.CurrentX = x;
+                lod.CurrentY = y;
+            }
+            lod.Stav = LodStav.NAKLADKA;
+            lod.TargetBodyName = lod.StartBodyName;
+        }
+    }
+
+    private void VytvorPrvkySceny()
+    {
+        if (CurrentScenario == null) return;
+
+        SpaceCanvas.Children.Clear();
+        _bodyVisuals.Clear();
+        _shipVisuals.Clear();
+
+        // Tělesa
+        foreach (var teleso in CurrentScenario.Bodies)
+        {
+            var visual = new TelesoVisual();
+
+            if (teleso.OrbitRadius > 0)
+            {
+                visual.OrbitLine = new Ellipse
+                {
+                    Stroke = new SolidColorBrush(Color.Parse("#40FFFFFF")),
+                    StrokeThickness = 1,
+                    StrokeDashArray = new Avalonia.Collections.AvaloniaList<double> { 2, 2 }
+                };
+                SpaceCanvas.Children.Add(visual.OrbitLine);
             }
 
-            double r = Math.Max(4, body.Size * 8);
-            IBrush bodyBrush = body.Type switch
+            IBrush fillBrush = teleso.Type.ToLower() switch
             {
-                BodyType.Star => Brushes.Gold,
-                BodyType.Planet => Brushes.DeepSkyBlue,
-                BodyType.Moon => Brushes.LightGray,
-                _ => Brushes.SaddleBrown
-            };
-            context.DrawEllipse(bodyBrush, null, center, r, r);
-
-            // Popisek a teploměr zásoby s rozlišenými offsety
-            string label = $"{body.Name} ({body.Warehouse})";
-            var text = new FormattedText(label, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Typeface.Default, 11, Brushes.Yellow);
-
-            // Offsety podle typu tělesa pro přehlednost
-            double textOffsetX = body.Type switch
-            {
-                BodyType.Moon => r + 4,
-                BodyType.Asteroid => -(r + 30),
-                _ => r + 5
+                "star" => Brushes.Gold,
+                "planet" => Brushes.DeepSkyBlue,
+                "moon" => Brushes.LightGray,
+                _ => Brushes.White
             };
 
-            double textOffsetY = body.Type switch
+            // Zajištění rozumné viditelné velikosti
+            double drawSize = Math.Max(12, teleso.Size);
+
+            visual.BodyShape = new Ellipse { Width = drawSize, Height = drawSize, Fill = fillBrush };
+            SpaceCanvas.Children.Add(visual.BodyShape);
+
+            visual.Label = new TextBlock
             {
-                BodyType.Moon => 6,        // Měsíce posuneme dolů
-                BodyType.Asteroid => -18,  // Asteroidy posuneme nahoru
-                _ => -14                   // Planety a hvězdy mírně nad střed
+                Text = teleso.Name,
+                Foreground = Brushes.White,
+                FontSize = 11,
+                FontWeight = FontWeight.Bold
             };
+            SpaceCanvas.Children.Add(visual.Label);
 
-            double barOffsetY = textOffsetY + 14;
+            visual.WarehouseBg = new Rectangle { Width = 32, Height = 4, Fill = Brushes.DarkGray };
+            visual.WarehouseFg = new Rectangle { Width = 0, Height = 4, Fill = Brushes.LimeGreen };
+            visual.WarehouseText = new TextBlock { Text = "0", Foreground = Brushes.LightGreen, FontSize = 10 };
 
-            context.DrawText(text, new Point(center.X + textOffsetX, center.Y + textOffsetY));
+            SpaceCanvas.Children.Add(visual.WarehouseBg);
+            SpaceCanvas.Children.Add(visual.WarehouseFg);
+            SpaceCanvas.Children.Add(visual.WarehouseText);
 
-            double barW = 35;
-            double barH = 4;
-            double fillRatio = Math.Clamp(body.Warehouse / 500.0, 0.0, 1.0);
-            context.DrawRectangle(Brushes.DimGray, null, new Rect(center.X + textOffsetX, center.Y + barOffsetY, barW, barH));
-            context.DrawRectangle(Brushes.LimeGreen, null, new Rect(center.X + textOffsetX, center.Y + barOffsetY, barW * fillRatio, barH));
+            _bodyVisuals.Add(teleso, visual);
         }
 
-        // 3. Vykreslení lodí a indikátorů
-        foreach (var ship in _engine.Ships)
+        // Lodě
+        foreach (var lod in CurrentScenario.Ships)
         {
-            var pos = WorldToScreen(ship.X, ship.Y);
+            var visual = new LodVisual();
 
-            context.DrawRectangle(Brushes.Cyan, null, new Rect(pos.X - 4, pos.Y - 4, 8, 8));
-
-            string shipLabel = $"{ship.Name} [{ship.CurrentCargo}/{ship.Capacity}]";
-            var shipText = new FormattedText(shipLabel, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Typeface.Default, 10, Brushes.White);
-            context.DrawText(shipText, new Point(pos.X + 8, pos.Y - 10));
-
-            if (ship.State != ShipState.InTransit)
+            visual.ShipShape = new Polygon
             {
-                string arrow = ship.IsLoadingArrow ? "▲" : "▼";
-                IBrush arrowBrush = ship.IsLoadingArrow ? Brushes.Lime : Brushes.Red;
-                var arrowText = new FormattedText(arrow, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Typeface.Default, 13, arrowBrush);
-                context.DrawText(arrowText, new Point(pos.X - 12, pos.Y - 8));
+                Points = new List<Avalonia.Point> { new(0, -7), new(-6, 6), new(6, 6) },
+                Fill = Brushes.Orange,
+                Stroke = Brushes.White,
+                StrokeThickness = 1
+            };
+            SpaceCanvas.Children.Add(visual.ShipShape);
+
+            visual.Label = new TextBlock { Text = lod.Name, Foreground = Brushes.Orange, FontSize = 10 };
+            visual.StatusArrow = new TextBlock { Text = "", Foreground = Brushes.Yellow, FontSize = 13, FontWeight = FontWeight.Bold };
+
+            SpaceCanvas.Children.Add(visual.Label);
+            SpaceCanvas.Children.Add(visual.StatusArrow);
+
+            _shipVisuals.Add(lod, visual);
+        }
+    }
+
+    private (double X, double Y) VypoctiFyzikalniPozici(VesmirneTeleso teleso, double simDays)
+    {
+        double uhelRad = (teleso.InitialAngle + teleso.AngularSpeed * simDays) * (Math.PI / 180.0);
+
+        double lokX = teleso.OrbitRadius * Math.Cos(uhelRad);
+        double lokY = -teleso.OrbitRadius * Math.Sin(uhelRad);
+
+        if (!string.IsNullOrEmpty(teleso.ParentName) && CurrentScenario != null)
+        {
+            var parent = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == teleso.ParentName);
+            if (parent != null)
+            {
+                var (pX, pY) = VypoctiFyzikalniPozici(parent, simDays);
+                return (pX + lokX, pY + lokY);
             }
+        }
+
+        return (lokX, lokY);
+    }
+
+    private (double ScreenX, double ScreenY) FyzikalniNaObrazovkove(double physX, double physY)
+    {
+        double canvasW = SpaceCanvas.Bounds.Width > 0 ? SpaceCanvas.Bounds.Width : 800;
+        double canvasH = SpaceCanvas.Bounds.Height > 0 ? SpaceCanvas.Bounds.Height : 600;
+
+        // Odsazení od okrajů okna
+        double margin = 80;
+
+        // Měřítko spočtené tak, aby se celý systém vešel do okna a rozprostřel po ploše
+        double scale = Math.Min((canvasW - 2 * margin) / (2 * _maxSystemRadius), (canvasH - 2 * margin) / (2 * _maxSystemRadius));
+
+        double centerX = canvasW / 2.0;
+        double centerY = canvasH / 2.0;
+
+        return (centerX + physX * scale, centerY + physY * scale);
+    }
+
+    // --- SIMULACE ---
+
+    private void SimTimer_Tick(object? sender, EventArgs e)
+    {
+        _simDate = _simDate.AddDays(1);
+        SimulationTimeText.Text = _simDate.ToString("dd. MM. yyyy");
+
+        if (CurrentScenario == null) return;
+
+        foreach (var body in CurrentScenario.Bodies)
+        {
+            if (body.ProdMax > 0)
+            {
+                body.Warehouse += _random.Next(body.ProdMin, body.ProdMax + 1);
+            }
+        }
+
+        foreach (var lod in CurrentScenario.Ships)
+        {
+            ProvedSimulaciLodi(lod);
+        }
+    }
+
+    private void ProvedSimulaciLodi(Lod lod)
+    {
+        if (CurrentScenario == null) return;
+
+        if (lod.Stav == LodStav.NA_CESTE)
+        {
+            var targetBody = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == lod.TargetBodyName);
+            if (targetBody == null) return;
+
+            var (targetX, targetY) = VypoctiFyzikalniPozici(targetBody, _totalSimDays);
+            double dx = targetX - lod.CurrentX;
+            double dy = targetY - lod.CurrentY;
+            double vzdalenost = Math.Sqrt(dx * dx + dy * dy);
+
+            if (vzdalenost <= lod.Speed)
+            {
+                lod.CurrentX = targetX;
+                lod.CurrentY = targetY;
+                lod.StartBodyName = lod.TargetBodyName;
+                lod.Stav = LodStav.VYKLADKA;
+            }
+            else
+            {
+                lod.CurrentX += (dx / vzdalenost) * lod.Speed;
+                lod.CurrentY += (dy / vzdalenost) * lod.Speed;
+            }
+        }
+        else if (lod.Stav == LodStav.VYKLADKA)
+        {
+            var currentBody = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == lod.StartBodyName);
+            if (lod.CurrentLoad > 0)
+            {
+                int vylozeno = Math.Min(lod.CurrentLoad, lod.TransferSpeed);
+                lod.CurrentLoad -= vylozeno;
+                if (currentBody != null) currentBody.Warehouse += vylozeno;
+            }
+
+            if (lod.CurrentLoad == 0)
+            {
+                lod.Stav = LodStav.NAKLADKA;
+                lod.DobaCekaniDni = 0;
+            }
+        }
+        else if (lod.Stav == LodStav.NAKLADKA)
+        {
+            var currentBody = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == lod.StartBodyName);
+            if (currentBody != null)
+            {
+                int mozneNacist = Math.Min(lod.Capacity - lod.CurrentLoad, Math.Min(currentBody.Warehouse, lod.TransferSpeed));
+                lod.CurrentLoad += mozneNacist;
+                currentBody.Warehouse -= mozneNacist;
+            }
+
+            lod.DobaCekaniDni++;
+
+            bool odletet = lod.Strategy switch
+            {
+                LoadStrategies.IMMEDIATE => true,
+                LoadStrategies.FULL => lod.CurrentLoad >= lod.Capacity,
+                LoadStrategies.MAX_LOADTIME => lod.CurrentLoad >= lod.Capacity || lod.DobaCekaniDni >= lod.MaxLoadTime,
+                _ => true
+            };
+
+            if (odletet)
+            {
+                string dalsiCil = VyberDalsiDestinaci(lod.StartBodyName);
+                if (!string.IsNullOrEmpty(dalsiCil))
+                {
+                    lod.TargetBodyName = dalsiCil;
+                    lod.Stav = LodStav.NA_CESTE;
+                    lod.DobaCekaniDni = 0;
+                }
+            }
+        }
+    }
+
+    private string VyberDalsiDestinaci(string sourceBodyName)
+    {
+        if (CurrentScenario == null) return string.Empty;
+
+        var mozne = CurrentScenario.Destinations.Where(d => d.Source == sourceBodyName).ToList();
+        if (mozne.Count == 0) return sourceBodyName;
+
+        int celkovaSuma = mozne.Sum(d => d.Probability);
+        if (celkovaSuma <= 0) return mozne[0].Target;
+
+        int hod = _random.Next(1, celkovaSuma + 1);
+        int mezipoucet = 0;
+
+        foreach (var dest in mozne)
+        {
+            mezipoucet += dest.Probability;
+            if (hod <= mezipoucet) return dest.Target;
+        }
+
+        return mozne[0].Target;
+    }
+
+    // --- VYKRESLOVÁNÍ (~60 FPS) ---
+
+    private void RenderTimer_Tick(object? sender, EventArgs e)
+    {
+        _totalSimDays += 0.016;
+
+        if (CurrentScenario == null) return;
+
+        double canvasW = SpaceCanvas.Bounds.Width > 0 ? SpaceCanvas.Bounds.Width : 800;
+        double canvasH = SpaceCanvas.Bounds.Height > 0 ? SpaceCanvas.Bounds.Height : 600;
+        double margin = 80;
+        double scale = Math.Min((canvasW - 2 * margin) / (2 * _maxSystemRadius), (canvasH - 2 * margin) / (2 * _maxSystemRadius));
+
+        // 1. Tělesa
+        foreach (var body in CurrentScenario.Bodies)
+        {
+            if (!_bodyVisuals.TryGetValue(body, out var vis)) continue;
+
+            var (physX, physY) = VypoctiFyzikalniPozici(body, _totalSimDays);
+            var (screenX, screenY) = FyzikalniNaObrazovkove(physX, physY);
+
+            // Oběžná dráha
+            if (vis.OrbitLine != null && !string.IsNullOrEmpty(body.ParentName))
+            {
+                var parent = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == body.ParentName);
+                if (parent != null)
+                {
+                    var (pX, pY) = VypoctiFyzikalniPozici(parent, _totalSimDays);
+                    var (parentSX, parentSY) = FyzikalniNaObrazovkove(pX, pY);
+
+                    double orbitDiameter = body.OrbitRadius * 2 * scale;
+                    vis.OrbitLine.Width = orbitDiameter;
+                    vis.OrbitLine.Height = orbitDiameter;
+                    Canvas.SetLeft(vis.OrbitLine, parentSX - orbitDiameter / 2);
+                    Canvas.SetTop(vis.OrbitLine, parentSY - orbitDiameter / 2);
+                }
+            }
+
+            double drawSize = Math.Max(12, body.Size);
+
+            Canvas.SetLeft(vis.BodyShape, screenX - drawSize / 2);
+            Canvas.SetTop(vis.BodyShape, screenY - drawSize / 2);
+
+            Canvas.SetLeft(vis.Label, screenX + drawSize / 2 + 4);
+            Canvas.SetTop(vis.Label, screenY - 14);
+
+            double fillRatio = Math.Min(1.0, body.Warehouse / 300.0);
+            Canvas.SetLeft(vis.WarehouseBg, screenX - 16);
+            Canvas.SetTop(vis.WarehouseBg, screenY + drawSize / 2 + 4);
+
+            vis.WarehouseFg.Width = 32 * fillRatio;
+            Canvas.SetLeft(vis.WarehouseFg, screenX - 16);
+            Canvas.SetTop(vis.WarehouseFg, screenY + drawSize / 2 + 4);
+
+            vis.WarehouseText.Text = $"{body.Warehouse}";
+            Canvas.SetLeft(vis.WarehouseText, screenX - 16);
+            Canvas.SetTop(vis.WarehouseText, screenY + drawSize / 2 + 9);
+        }
+
+        // 2. Lodě
+        foreach (var lod in CurrentScenario.Ships)
+        {
+            if (!_shipVisuals.TryGetValue(lod, out var vis)) continue;
+
+            double physX = lod.CurrentX;
+            double physY = lod.CurrentY;
+
+            if (lod.Stav != LodStav.NA_CESTE)
+            {
+                var dockedBody = CurrentScenario.Bodies.FirstOrDefault(b => b.Name == lod.StartBodyName);
+                if (dockedBody != null)
+                {
+                    (physX, physY) = VypoctiFyzikalniPozici(dockedBody, _totalSimDays);
+                    lod.CurrentX = physX;
+                    lod.CurrentY = physY;
+                }
+            }
+
+            var (screenX, screenY) = FyzikalniNaObrazovkove(physX, physY);
+
+            if (lod.Stav != LodStav.NA_CESTE) screenY -= 16;
+
+            Canvas.SetLeft(vis.ShipShape, screenX);
+            Canvas.SetTop(vis.ShipShape, screenY);
+
+            vis.Label.Text = $"{lod.Name} ({lod.CurrentLoad}/{lod.Capacity})";
+            Canvas.SetLeft(vis.Label, screenX + 10);
+            Canvas.SetTop(vis.Label, screenY - 7);
+
+            vis.StatusArrow.Text = lod.Stav switch
+            {
+                LodStav.VYKLADKA => "↓",
+                LodStav.NAKLADKA => "↑",
+                _ => ""
+            };
+            Canvas.SetLeft(vis.StatusArrow, screenX - 14);
+            Canvas.SetTop(vis.StatusArrow, screenY - 9);
         }
     }
 }

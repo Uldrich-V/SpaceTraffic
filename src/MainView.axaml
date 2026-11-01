@@ -1,7 +1,20 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-             mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
              x:Class="SpaceTraffic.MainView">
+    
+    <Grid>
+        <!-- Pozadí vesmíru a plátno pro vykreslování -->
+        <Canvas Name="SpaceCanvas" Background="#0A0A1E" ClipToBounds="True" />
+        
+        <!-- Zobrazení simulačního času a stavu v levém horním rohu -->
+        <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="15" 
+                Background="#CC101020" CornerRadius="6" Padding="12,8">
+            <StackPanel Spacing="3">
+                <TextBlock Text="Simulační čas:" Foreground="#A0A0B0" FontSize="11" />
+                <TextBlock Name="SimulationTimeText" Text="21. 09. 2026" Foreground="White" FontSize="16" FontWeight="Bold" />
+                <TextBlock Name="SimStatusText" Text="Simulace běží (1s = 1 den)" Foreground="#00FFCC" FontSize="11" Margin="0,3,0,0"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+    
 </UserControl>

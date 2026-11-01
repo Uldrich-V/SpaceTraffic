@@ -5,21 +5,20 @@ namespace SpaceTraffic
 {
     public partial class MainWindow : Window
     {
+        public MainWindow() : this("default")
+        {
+        }
         /// <summary>
         /// Initializes new MainWindow without any specified scenario
         /// </summary>
-        public MainWindow()
+        public MainWindow(string scenarioName)
         {
             InitializeComponent();
+            if (this.Content is MainView mainView)
+            {
+                mainView.NactiScenar(scenarioName);
+            }
         }
 
-        /// <summary>
-        /// Initializes new MainWindow with specified scenario
-        /// </summary>
-        /// <param name="scenario">name of the scenario</param>
-        public MainWindow(string scenario) : this()
-        {
-            //TODO: load scenario, or throw an exception if it does not exist
-        }
     }
 }
